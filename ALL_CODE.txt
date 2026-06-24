@@ -1,0 +1,1303 @@
+╔══════════════════════════════════════════════════════════════════════════════╗
+║           AI PLACEMENT AGENT — COMPLETE SOURCE CODE (ALL FILES)            ║
+║           Project: AI Placement Agent using Zapier + Gemini                ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+Files included:
+  1.  app.py                    ← Flask backend (routes, Gemini AI, Gmail)
+  2.  requirements.txt          ← Python dependencies
+  3.  .env.example              ← Environment variable template
+  4.  templates/index.html      ← Dashboard HTML (Jinja2)
+  5.  static/style.css          ← Responsive stylesheet
+  6.  static/script.js          ← Frontend JavaScript
+  7.  README.md                 ← Setup & deployment guide
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FILE 1 of 7 │ app.py
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+"""
+AI Placement Agent - Flask Application
+Integrates Google Forms, Sheets, Zapier, Gemini AI, and Gmail
+to deliver personalized career recommendations to students.
+"""
+
+import os
+import json
+import smtplib
+import logging
+from datetime import datetime
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+
+import requests
+from flask import Flask, request, jsonify, render_template
+from dotenv import load_dotenv
+
+# ---------------------------------------------------------------------------
+# Setup
+# ---------------------------------------------------------------------------
+
+load_dotenv()
+
+app = Flask(__name__)
+app.secret_key = os.getenv("FLASK_SECRET_KEY", "change-me-in-production")
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# In-memory store (replace with a database for production)
+submissions = []
+
+# ---------------------------------------------------------------------------
+# Gemini helpers
+# ---------------------------------------------------------------------------
+
+GEMINI_API_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    "gemini-1.5-flash:generateContent"
+)
+
+GEMINI_PROMPT_TEMPLATE = """
+Analyze the following student profile and provide detailed career guidance:
+
+Name: {name}
+Skills: {skills}
+Preferred Domain: {domain}
+Graduation Year: {graduation_year}
+
+Please provide a structured response with the following sections:
+
+1. TOP 3 SUITABLE JOB ROLES
+   - List three specific job titles that match the student's profile
+   - Include a brief reason for each
+
+2. CAREER RECOMMENDATION
+   - A personalized career path recommendation (2-3 sentences)
+
+3. SKILLS TO IMPROVE
+   - List 5 specific technical or soft skills the student should develop
+
+4. LEARNING ROADMAP
+   - A step-by-step 6-month learning plan with clear milestones
+
+5. PLACEMENT READINESS SCORE
+   - Score: X/100
+   - Brief justification for the score
+
+Format the response in a clear, professional, and encouraging manner suitable
+for a student email.
+"""
+
+
+def call_gemini(name: str, skills: str, domain: str, graduation_year: str) -> str:
+    """
+    Send student data to Gemini AI and return the generated recommendations.
+    Raises RuntimeError if the API call fails or the key is missing.
+    """
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "GEMINI_API_KEY is not set. Add it to your .env file."
+        )
+
+    prompt = GEMINI_PROMPT_TEMPLATE.format(
+        name=name,
+        skills=skills,
+        domain=domain,
+        graduation_year=graduation_year,
+    )
+
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.7,
+            "maxOutputTokens": 1500,
+        },
+    }
+
+    response = requests.post(
+        f"{GEMINI_API_URL}?key={api_key}",
+        json=payload,
+        timeout=30,
+    )
+    response.raise_for_status()
+
+    data = response.json()
+    try:
+        return data["candidates"][0]["content"]["parts"][0]["text"]
+    except (KeyError, IndexError) as exc:
+        logger.error("Unexpected Gemini response structure: %s", data)
+        raise RuntimeError("Could not parse Gemini response.") from exc
+
+
+# ---------------------------------------------------------------------------
+# Email helpers
+# ---------------------------------------------------------------------------
+
+EMAIL_TEMPLATE = """\
+Dear {name},
+
+Thank you for registering with the AI Placement Agent. Based on your profile,
+here are your personalized career recommendations:
+
+---
+
+{recommendations}
+
+---
+
+We wish you the very best in your career journey!
+
+Warm regards,
+AI Placement Agent Team
+
+---
+This email was generated automatically. Please do not reply directly.
+"""
+
+
+def send_email(recipient: str, name: str, recommendations: str) -> bool:
+    """
+    Send the career recommendations email via Gmail SMTP.
+    Returns True on success, False on failure.
+    """
+    sender = os.getenv("GMAIL_SENDER")
+    password = os.getenv("GMAIL_APP_PASSWORD")
+
+    if not sender or not password:
+        logger.warning(
+            "Gmail credentials not configured — email will not be sent."
+        )
+        return False
+
+    body = EMAIL_TEMPLATE.format(name=name, recommendations=recommendations)
+
+    message = MIMEMultipart("alternative")
+    message["Subject"] = f"Your AI Career Recommendations — {name}"
+    message["From"] = sender
+    message["To"] = recipient
+    message.attach(MIMEText(body, "plain"))
+
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(sender, password)
+            server.sendmail(sender, recipient, message.as_string())
+        logger.info("Email sent to %s", recipient)
+        return True
+    except smtplib.SMTPException as exc:
+        logger.error("Failed to send email: %s", exc)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
+@app.route("/")
+def index():
+    """Render the main dashboard."""
+    return render_template("index.html")
+
+
+@app.route("/api/submit", methods=["POST"])
+def submit():
+    """
+    Accept a student form submission, call Gemini, optionally send an email,
+    and return the recommendations as JSON.
+
+    Expected JSON body:
+        name, email, skills, domain, graduation_year
+    """
+    data = request.get_json(force=True)
+
+    # Validate required fields
+    required = ["name", "email", "skills", "domain", "graduation_year"]
+    missing = [field for field in required if not data.get(field, "").strip()]
+    if missing:
+        return jsonify({"error": f"Missing fields: {', '.join(missing)}"}), 400
+
+    name = data["name"].strip()
+    email = data["email"].strip()
+    skills = data["skills"].strip()
+    domain = data["domain"].strip()
+    graduation_year = data["graduation_year"].strip()
+
+    # --- Gemini AI call ---
+    try:
+        recommendations = call_gemini(name, skills, domain, graduation_year)
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 500
+    except requests.RequestException as exc:
+        logger.error("Gemini API request failed: %s", exc)
+        return jsonify({"error": "Gemini API call failed. Check your API key and network."}), 502
+
+    # --- Email ---
+    email_sent = send_email(email, name, recommendations)
+
+    # --- Persist in memory ---
+    record = {
+        "id": len(submissions) + 1,
+        "name": name,
+        "email": email,
+        "skills": skills,
+        "domain": domain,
+        "graduation_year": graduation_year,
+        "recommendations": recommendations,
+        "email_sent": email_sent,
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+    }
+    submissions.append(record)
+
+    return jsonify({
+        "success": True,
+        "message": "Analysis complete!",
+        "recommendations": recommendations,
+        "email_sent": email_sent,
+        "record_id": record["id"],
+    })
+
+
+@app.route("/api/submissions", methods=["GET"])
+def get_submissions():
+    """Return all stored submissions (most recent first)."""
+    return jsonify(list(reversed(submissions)))
+
+
+@app.route("/api/zapier-webhook", methods=["POST"])
+def zapier_webhook():
+    """
+    Zapier webhook endpoint.
+
+    Zapier sends a POST request here when a new row is added to Google Sheets.
+    Expected JSON body:
+        name, email, skills, domain, graduation_year
+    """
+    data = request.get_json(force=True)
+    logger.info("Zapier webhook received: %s", json.dumps(data, indent=2))
+
+    name = data.get("name", "").strip()
+    email = data.get("email", "").strip()
+    skills = data.get("skills", "").strip()
+    domain = data.get("domain", "").strip()
+    graduation_year = data.get("graduation_year", "").strip()
+
+    if not all([name, email, skills, domain, graduation_year]):
+        return jsonify({"error": "Incomplete data from Zapier."}), 400
+
+    try:
+        recommendations = call_gemini(name, skills, domain, graduation_year)
+    except (RuntimeError, requests.RequestException) as exc:
+        logger.error("Gemini call failed in webhook: %s", exc)
+        return jsonify({"error": str(exc)}), 500
+
+    email_sent = send_email(email, name, recommendations)
+
+    record = {
+        "id": len(submissions) + 1,
+        "name": name,
+        "email": email,
+        "skills": skills,
+        "domain": domain,
+        "graduation_year": graduation_year,
+        "recommendations": recommendations,
+        "email_sent": email_sent,
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "source": "zapier",
+    }
+    submissions.append(record)
+
+    return jsonify({
+        "success": True,
+        "message": f"Processed and emailed {name}.",
+        "email_sent": email_sent,
+    })
+
+
+@app.route("/api/health", methods=["GET"])
+def health():
+    """Simple health-check endpoint."""
+    return jsonify({"status": "ok", "submissions": len(submissions)})
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 5000))
+    debug = os.getenv("FLASK_ENV", "production") == "development"
+    app.run(host="0.0.0.0", port=port, debug=debug)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FILE 2 of 7 │ requirements.txt
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+flask==3.1.0
+python-dotenv==1.0.1
+requests==2.32.3
+gunicorn==22.0.0
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FILE 3 of 7 │ .env.example
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# -------------------------------------------------------
+# AI Placement Agent — Environment Variables
+# Copy this file to .env and fill in your real values.
+# NEVER commit .env to version control.
+# -------------------------------------------------------
+
+# Google Gemini AI
+# Get your key at: https://aistudio.google.com/app/apikey
+GEMINI_API_KEY=your_gemini_api_key_here
+
+# Gmail SMTP (for sending recommendation emails)
+# Use a Gmail App Password, NOT your real password.
+# Guide: https://support.google.com/accounts/answer/185833
+GMAIL_SENDER=your_gmail_address@gmail.com
+GMAIL_APP_PASSWORD=your_16_char_app_password
+
+# Flask
+FLASK_SECRET_KEY=replace_with_a_long_random_string
+FLASK_ENV=development   # Set to "production" for live deployments
+PORT=5000
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FILE 4 of 7 │ templates/index.html
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI Placement Agent — Career Guidance Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+</head>
+<body>
+
+<!-- ── Navbar ─────────────────────────────────────────────────── -->
+<nav class="navbar" role="banner">
+  <div class="wrapper">
+    <div class="navbar-brand">
+      <span class="icon">🎓</span>
+      AI Placement Agent
+      <span class="navbar-badge">Gemini AI</span>
+    </div>
+  </div>
+</nav>
+
+<!-- ── Hero ───────────────────────────────────────────────────── -->
+<header class="hero">
+  <div class="wrapper">
+    <h1>Your Personal Career Guidance Platform</h1>
+    <p>Powered by Google Gemini AI • Integrated with Zapier &amp; Gmail</p>
+  </div>
+</header>
+
+<!-- ── Stats bar ──────────────────────────────────────────────── -->
+<section aria-label="Statistics">
+  <div class="wrapper">
+    <div class="stats-bar">
+      <div class="stat-card">
+        <div class="stat-value" id="stat-submissions">0</div>
+        <div class="stat-label">Analyses Run</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-value">Gemini</div>
+        <div class="stat-label">AI Engine</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-value">Zapier</div>
+        <div class="stat-label">Automation</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-value">Gmail</div>
+        <div class="stat-label">Delivery</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── Main content ───────────────────────────────────────────── -->
+<main class="section">
+  <div class="wrapper">
+
+    <!-- Tab navigation -->
+    <nav class="tab-nav" role="tablist" aria-label="Dashboard sections">
+      <button class="tab-btn active" role="tab" data-tab="tab-register" aria-selected="true">
+        📝 Register
+      </button>
+      <button class="tab-btn" role="tab" data-tab="tab-submissions" aria-selected="false">
+        📋 Submissions
+      </button>
+      <button class="tab-btn" role="tab" data-tab="tab-zapier" aria-selected="false">
+        ⚡ Zapier Setup
+      </button>
+      <button class="tab-btn" role="tab" data-tab="tab-api" aria-selected="false">
+        🔗 API Docs
+      </button>
+    </nav>
+
+    <!-- ── Tab: Register ──────────────────────────────────────── -->
+    <div id="tab-register" class="tab-panel active" role="tabpanel">
+      <div class="main-grid">
+
+        <!-- Form card -->
+        <div class="card">
+          <div class="card-header">
+            <div class="card-icon">📝</div>
+            <div>
+              <h2>Student Registration</h2>
+              <p style="font-size:.82rem;margin-top:.1rem">Submit your profile for AI-powered career guidance</p>
+            </div>
+          </div>
+
+          <div id="form-alert"></div>
+
+          <form id="registration-form" novalidate>
+            <div class="form-group">
+              <label for="name">Full Name <span style="color:var(--danger)">*</span></label>
+              <input
+                type="text" id="name" name="name"
+                placeholder="e.g. Priya Sharma"
+                required autocomplete="name"
+              />
+            </div>
+
+            <div class="form-group">
+              <label for="email">Email Address <span style="color:var(--danger)">*</span></label>
+              <input
+                type="email" id="email" name="email"
+                placeholder="priya@example.com"
+                required autocomplete="email"
+              />
+            </div>
+
+            <div class="form-group">
+              <label for="skills">Skills <span style="color:var(--danger)">*</span></label>
+              <textarea
+                id="skills" name="skills" rows="3"
+                placeholder="e.g. Python, Machine Learning, SQL, Excel, Communication…"
+                required
+              ></textarea>
+            </div>
+
+            <div class="form-group">
+              <label for="domain">Preferred Domain <span style="color:var(--danger)">*</span></label>
+              <select id="domain" name="domain" required>
+                <option value="">— Select a domain —</option>
+                <option value="Software Engineering">Software Engineering</option>
+                <option value="Data Science &amp; Analytics">Data Science &amp; Analytics</option>
+                <option value="Artificial Intelligence / ML">Artificial Intelligence / ML</option>
+                <option value="Cloud &amp; DevOps">Cloud &amp; DevOps</option>
+                <option value="Web Development">Web Development</option>
+                <option value="Cybersecurity">Cybersecurity</option>
+                <option value="Product Management">Product Management</option>
+                <option value="Finance &amp; Banking">Finance &amp; Banking</option>
+                <option value="Marketing &amp; Growth">Marketing &amp; Growth</option>
+                <option value="Operations &amp; Supply Chain">Operations &amp; Supply Chain</option>
+                <option value="Other">Other</option>
+              </select>
+            </div>
+
+            <div class="form-group">
+              <label for="graduation_year">Graduation Year <span style="color:var(--danger)">*</span></label>
+              <select id="graduation_year" name="graduation_year" required>
+                <option value="">— Select year —</option>
+                <option>2024</option>
+                <option>2025</option>
+                <option>2026</option>
+                <option>2027</option>
+                <option>2028</option>
+              </select>
+            </div>
+
+            <div id="form-loader" class="loader">
+              <div class="spinner"></div>
+              <p>Gemini AI is analysing your profile… this may take 10–20 seconds.</p>
+            </div>
+
+            <button type="submit" class="btn btn-primary">
+              🚀 Get My Career Recommendations
+            </button>
+          </form>
+        </div>
+
+        <!-- Output card -->
+        <div class="card" id="output-section" style="display:none">
+          <div class="card-header">
+            <div class="card-icon">✨</div>
+            <div>
+              <h2>AI Career Recommendations</h2>
+              <p style="font-size:.82rem;margin-top:.1rem">Generated by Google Gemini</p>
+            </div>
+          </div>
+          <div class="recommendations-box" id="recommendations-box"></div>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- ── Tab: Submissions ───────────────────────────────────── -->
+    <div id="tab-submissions" class="tab-panel" role="tabpanel">
+      <div class="card">
+        <div class="card-header">
+          <div class="card-icon">📋</div>
+          <h2>All Submissions</h2>
+        </div>
+
+        <div id="submissions-empty" class="empty-state" style="display:none">
+          <div class="icon">📭</div>
+          <p>No submissions yet. Register a student to see results here.</p>
+        </div>
+
+        <div class="table-wrapper">
+          <table aria-label="Student submissions">
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Email</th>
+                <th>Domain</th>
+                <th>Grad Year</th>
+                <th>Skills</th>
+                <th>Email Status</th>
+                <th>Submitted At</th>
+              </tr>
+            </thead>
+            <tbody id="submissions-tbody">
+              <tr>
+                <td colspan="7" style="text-align:center;padding:1.5rem;color:var(--text-muted)">
+                  Click the Submissions tab to load data.
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Tab: Zapier Setup ──────────────────────────────────── -->
+    <div id="tab-zapier" class="tab-panel" role="tabpanel">
+      <div class="grid-2">
+
+        <div class="card">
+          <div class="card-header">
+            <div class="card-icon">⚡</div>
+            <h2>Zapier Integration Guide</h2>
+          </div>
+          <ol class="steps-list" style="counter-reset:step">
+            <li>
+              <span class="step-num"></span>
+              <div class="step-text">
+                <strong>Create a Google Form</strong><br>
+                Add fields: Full Name, Email, Skills, Preferred Domain, Graduation Year.
+              </div>
+            </li>
+            <li>
+              <span class="step-num"></span>
+              <div class="step-text">
+                <strong>Link to Google Sheets</strong><br>
+                Form → Responses → click the Sheets icon.
+              </div>
+            </li>
+            <li>
+              <span class="step-num"></span>
+              <div class="step-text">
+                <strong>Create a Zapier account</strong><br>
+                Visit <a href="https://zapier.com" target="_blank" rel="noopener">zapier.com</a> and sign up.
+              </div>
+            </li>
+            <li>
+              <span class="step-num"></span>
+              <div class="step-text">
+                <strong>New Zap → Trigger: Google Sheets</strong><br>
+                Choose <em>New Spreadsheet Row</em>.
+              </div>
+            </li>
+            <li>
+              <span class="step-num"></span>
+              <div class="step-text">
+                <strong>Action: Webhooks by Zapier → POST</strong><br>
+                URL: <code>https://your-app.replit.app/api/zapier-webhook</code><br>
+                Map columns to: <code>name</code>, <code>email</code>, <code>skills</code>,
+                <code>domain</code>, <code>graduation_year</code>.
+              </div>
+            </li>
+            <li>
+              <span class="step-num"></span>
+              <div class="step-text">
+                <strong>Test the Zap</strong><br>
+                Submit a test form entry and verify the email is delivered.
+              </div>
+            </li>
+            <li>
+              <span class="step-num"></span>
+              <div class="step-text">
+                <strong>Turn the Zap ON</strong><br>
+                Every new row now triggers AI analysis + email automatically.
+              </div>
+            </li>
+          </ol>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <div class="card-icon">🔌</div>
+            <h2>Webhook Payload Format</h2>
+          </div>
+          <p style="margin-bottom:1rem">
+            Zapier sends a <strong>POST</strong> to <code>/api/zapier-webhook</code>:
+          </p>
+          <pre style="background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:1rem;font-size:.82rem;overflow-x:auto"><code>{
+  "name":            "Priya Sharma",
+  "email":           "priya@example.com",
+  "skills":          "Python, ML, SQL",
+  "domain":          "Data Science &amp; Analytics",
+  "graduation_year": "2025"
+}</code></pre>
+          <p style="margin-top:1.25rem;margin-bottom:.75rem">Server responds with:</p>
+          <pre style="background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:1rem;font-size:.82rem;overflow-x:auto"><code>{
+  "success":    true,
+  "message":    "Processed and emailed Priya Sharma.",
+  "email_sent": true
+}</code></pre>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- ── Tab: API Docs ──────────────────────────────────────── -->
+    <div id="tab-api" class="tab-panel" role="tabpanel">
+      <div class="card">
+        <div class="card-header">
+          <div class="card-icon">🔗</div>
+          <h2>API Reference</h2>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:1.5rem">
+          <div>
+            <h3><span class="badge badge-success">POST</span> &nbsp;<code>/api/submit</code></h3>
+            <p>Submit student data and receive AI-generated recommendations.</p>
+          </div>
+          <div>
+            <h3><span class="badge badge-neutral">GET</span> &nbsp;<code>/api/submissions</code></h3>
+            <p>Retrieve all submissions (most recent first).</p>
+          </div>
+          <div>
+            <h3><span class="badge badge-success">POST</span> &nbsp;<code>/api/zapier-webhook</code></h3>
+            <p>Zapier webhook — same fields as <code>/api/submit</code>.</p>
+          </div>
+          <div>
+            <h3><span class="badge badge-neutral">GET</span> &nbsp;<code>/api/health</code></h3>
+            <p>Health check — returns server status and submission count.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</main>
+
+<!-- ── Footer ─────────────────────────────────────────────────── -->
+<footer class="footer">
+  <div class="wrapper">
+    AI Placement Agent &mdash; Built with Flask &bull; Google Gemini AI &bull; Zapier &bull; Gmail
+  </div>
+</footer>
+
+<script src="{{ url_for('static', filename='script.js') }}"></script>
+</body>
+</html>
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FILE 5 of 7 │ static/style.css
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/* ============================================================
+   AI Placement Agent — Stylesheet
+   ============================================================ */
+
+/* ---------- Reset & Base ---------- */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --primary:       #4f46e5;
+  --primary-dark:  #3730a3;
+  --primary-light: #e0e7ff;
+  --accent:        #10b981;
+  --accent-dark:   #059669;
+  --danger:        #ef4444;
+  --warn:          #f59e0b;
+  --surface:       #ffffff;
+  --surface-2:     #f8fafc;
+  --border:        #e2e8f0;
+  --text:          #1e293b;
+  --text-muted:    #64748b;
+  --shadow-sm:     0 1px 3px rgba(0,0,0,.08);
+  --shadow-md:     0 4px 16px rgba(0,0,0,.10);
+  --shadow-lg:     0 8px 32px rgba(0,0,0,.14);
+  --radius:        12px;
+  --radius-sm:     8px;
+  --transition:    .2s ease;
+}
+
+html { scroll-behavior: smooth; }
+
+body {
+  font-family: 'Inter', 'Segoe UI', system-ui, sans-serif;
+  background: var(--surface-2);
+  color: var(--text);
+  line-height: 1.6;
+  min-height: 100vh;
+}
+
+/* ---------- Typography ---------- */
+h1, h2, h3, h4 { line-height: 1.3; font-weight: 700; }
+h1 { font-size: clamp(1.6rem, 4vw, 2.2rem); }
+h2 { font-size: 1.4rem; }
+h3 { font-size: 1.1rem; }
+p  { color: var(--text-muted); }
+
+/* ---------- Layout ---------- */
+.wrapper { max-width: 1100px; margin: 0 auto; padding: 0 1.25rem; }
+
+/* ---------- Navbar ---------- */
+.navbar {
+  background: var(--primary);
+  color: #fff;
+  padding: 1rem 0;
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  box-shadow: var(--shadow-md);
+}
+.navbar .wrapper { display: flex; align-items: center; gap: 1rem; }
+.navbar-brand {
+  display: flex; align-items: center; gap: .6rem;
+  font-size: 1.25rem; font-weight: 800; letter-spacing: -.5px;
+}
+.navbar-brand .icon { font-size: 1.5rem; }
+.navbar-badge {
+  background: var(--accent); color: #fff;
+  font-size: .65rem; font-weight: 700;
+  padding: .15rem .45rem; border-radius: 20px;
+  letter-spacing: .5px; text-transform: uppercase;
+}
+
+/* ---------- Hero ---------- */
+.hero {
+  background: linear-gradient(135deg, var(--primary) 0%, #7c3aed 100%);
+  color: #fff; padding: 3.5rem 0 4rem;
+  text-align: center;
+  clip-path: ellipse(100% 85% at 50% 15%);
+}
+.hero h1 { color: #fff; margin-bottom: .6rem; }
+.hero p  { color: rgba(255,255,255,.8); font-size: 1.05rem; }
+
+/* ---------- Cards ---------- */
+.card {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 1.75rem;
+  box-shadow: var(--shadow-sm); transition: box-shadow var(--transition);
+}
+.card:hover { box-shadow: var(--shadow-md); }
+.card-header {
+  display: flex; align-items: center; gap: .6rem;
+  margin-bottom: 1.25rem; padding-bottom: 1rem;
+  border-bottom: 1px solid var(--border);
+}
+.card-icon {
+  width: 36px; height: 36px; border-radius: var(--radius-sm);
+  background: var(--primary-light); color: var(--primary);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 1rem; flex-shrink: 0;
+}
+.card-header h2 { font-size: 1.1rem; }
+
+/* ---------- Grid ---------- */
+.grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 1.5rem; }
+.main-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; align-items: start; }
+@media (max-width: 768px) { .main-grid { grid-template-columns: 1fr; } }
+
+/* ---------- Section ---------- */
+.section { padding: 2.5rem 0; }
+
+/* ---------- Stats ---------- */
+.stats-bar { display: flex; gap: 1rem; flex-wrap: wrap; padding: 1.25rem 0; }
+.stat-card {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); padding: 1rem 1.5rem;
+  flex: 1 1 140px; text-align: center; box-shadow: var(--shadow-sm);
+}
+.stat-value { font-size: 2rem; font-weight: 800; color: var(--primary); line-height: 1; }
+.stat-label { font-size: .78rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: .5px; margin-top: .25rem; }
+
+/* ---------- Form ---------- */
+.form-group { display: flex; flex-direction: column; gap: .35rem; margin-bottom: 1rem; }
+.form-group label { font-size: .85rem; font-weight: 600; color: var(--text); }
+.form-group input,
+.form-group select,
+.form-group textarea {
+  width: 100%; padding: .65rem .9rem;
+  border: 1.5px solid var(--border); border-radius: var(--radius-sm);
+  font-size: .95rem; font-family: inherit; color: var(--text);
+  background: var(--surface);
+  transition: border-color var(--transition), box-shadow var(--transition);
+  outline: none;
+}
+.form-group input:focus,
+.form-group select:focus,
+.form-group textarea:focus {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px rgba(79,70,229,.15);
+}
+.form-group textarea { resize: vertical; min-height: 80px; }
+
+/* ---------- Buttons ---------- */
+.btn {
+  display: inline-flex; align-items: center; gap: .5rem;
+  padding: .7rem 1.4rem; border-radius: var(--radius-sm);
+  font-size: .9rem; font-weight: 600; font-family: inherit;
+  cursor: pointer; border: none;
+  transition: background var(--transition), transform var(--transition), box-shadow var(--transition);
+}
+.btn:active { transform: translateY(1px); }
+.btn-primary {
+  background: var(--primary); color: #fff;
+  width: 100%; justify-content: center; padding: .85rem; font-size: 1rem;
+  box-shadow: 0 2px 8px rgba(79,70,229,.35);
+}
+.btn-primary:hover:not(:disabled) { background: var(--primary-dark); box-shadow: 0 4px 16px rgba(79,70,229,.45); }
+.btn-primary:disabled { opacity: .6; cursor: not-allowed; }
+.btn-outline { background: transparent; color: var(--primary); border: 1.5px solid var(--primary); }
+.btn-outline:hover { background: var(--primary-light); }
+
+/* ---------- Alert ---------- */
+.alert {
+  padding: .85rem 1.1rem; border-radius: var(--radius-sm);
+  font-size: .9rem; display: flex; align-items: flex-start; gap: .5rem; margin-bottom: 1rem;
+}
+.alert-success { background: #ecfdf5; color: #065f46; border: 1px solid #a7f3d0; }
+.alert-error   { background: #fef2f2; color: #991b1b; border: 1px solid #fca5a5; }
+.alert-info    { background: #eff6ff; color: #1e40af; border: 1px solid #bfdbfe; }
+
+/* ---------- Recommendations ---------- */
+.recommendations-box {
+  background: var(--surface-2); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); padding: 1.25rem;
+  white-space: pre-wrap; font-size: .88rem; line-height: 1.8;
+  max-height: 500px; overflow-y: auto; color: var(--text);
+}
+.recommendations-box:empty::before {
+  content: 'AI recommendations will appear here after submission…';
+  color: var(--text-muted); font-style: italic;
+}
+
+/* ---------- Table ---------- */
+.table-wrapper { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: .85rem; }
+thead { background: var(--primary-light); }
+thead th {
+  padding: .75rem 1rem; text-align: left; font-weight: 700;
+  font-size: .78rem; text-transform: uppercase; letter-spacing: .5px; color: var(--primary);
+}
+tbody tr { border-bottom: 1px solid var(--border); transition: background var(--transition); }
+tbody tr:hover { background: var(--surface-2); }
+tbody td { padding: .75rem 1rem; vertical-align: top; }
+.badge { display: inline-block; padding: .2rem .55rem; border-radius: 20px; font-size: .72rem; font-weight: 700; }
+.badge-success { background: #dcfce7; color: #166534; }
+.badge-warn    { background: #fef9c3; color: #854d0e; }
+.badge-neutral { background: #f1f5f9; color: #475569; }
+
+/* ---------- Loader ---------- */
+.loader { display: none; text-align: center; padding: 2rem; color: var(--text-muted); }
+.loader.active { display: block; }
+.spinner {
+  width: 40px; height: 40px;
+  border: 4px solid var(--border); border-top-color: var(--primary);
+  border-radius: 50%; animation: spin .8s linear infinite; margin: 0 auto .75rem;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ---------- Steps ---------- */
+.steps-list { counter-reset: step; list-style: none; display: flex; flex-direction: column; gap: .85rem; }
+.steps-list li { display: flex; gap: .85rem; align-items: flex-start; }
+.step-num {
+  counter-increment: step; width: 28px; height: 28px; border-radius: 50%;
+  background: var(--primary); color: #fff; font-size: .78rem; font-weight: 700;
+  display: flex; align-items: center; justify-content: center; flex-shrink: 0; margin-top: .1rem;
+}
+.step-num::before { content: counter(step); }
+.step-text { font-size: .88rem; }
+.step-text strong { color: var(--text); font-weight: 600; }
+code {
+  background: var(--primary-light); color: var(--primary-dark);
+  padding: .1rem .35rem; border-radius: 4px; font-size: .82rem; font-family: 'Fira Code', monospace;
+}
+
+/* ---------- Tabs ---------- */
+.tab-nav { display: flex; gap: .5rem; border-bottom: 2px solid var(--border); margin-bottom: 1.5rem; flex-wrap: wrap; }
+.tab-btn {
+  padding: .55rem 1.1rem; border: none; background: transparent;
+  font-size: .9rem; font-weight: 600; font-family: inherit; color: var(--text-muted);
+  cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -2px;
+  transition: color var(--transition), border-color var(--transition);
+}
+.tab-btn:hover { color: var(--primary); }
+.tab-btn.active { color: var(--primary); border-bottom-color: var(--primary); }
+.tab-panel { display: none; }
+.tab-panel.active { display: block; }
+
+/* ---------- Empty state ---------- */
+.empty-state { text-align: center; padding: 3rem 1rem; color: var(--text-muted); }
+.empty-state .icon { font-size: 3rem; margin-bottom: .75rem; }
+.empty-state p { font-size: .95rem; }
+
+/* ---------- Footer ---------- */
+.footer {
+  text-align: center; padding: 2rem 0; font-size: .82rem;
+  color: var(--text-muted); border-top: 1px solid var(--border); margin-top: 3rem;
+}
+
+/* ---------- Responsive ---------- */
+@media (max-width: 560px) {
+  .card { padding: 1.25rem; }
+  .hero { clip-path: none; padding-bottom: 2.5rem; }
+}
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FILE 6 of 7 │ static/script.js
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/**
+ * AI Placement Agent — Frontend Script
+ * Handles form submission, tab switching, data table, and stat updates.
+ */
+
+"use strict";
+
+// ─────────────────────────────────────────────
+// Utilities
+// ─────────────────────────────────────────────
+
+/** Display an alert message inside a container element. */
+function showAlert(container, message, type = "info") {
+  const icons = { success: "✅", error: "❌", info: "ℹ️" };
+  container.innerHTML = `
+    <div class="alert alert-${type}" role="alert">
+      <span>${icons[type] ?? "ℹ️"}</span>
+      <span>${message}</span>
+    </div>`;
+}
+
+/** Format an ISO timestamp to a human-readable string. */
+function formatTime(iso) {
+  try {
+    return new Date(iso).toLocaleString(undefined, {
+      dateStyle: "medium",
+      timeStyle: "short",
+    });
+  } catch {
+    return iso;
+  }
+}
+
+/** Truncate a string to `max` characters with an ellipsis. */
+function truncate(str, max = 100) {
+  if (!str) return "—";
+  return str.length > max ? str.slice(0, max) + "…" : str;
+}
+
+// ─────────────────────────────────────────────
+// Tab navigation
+// ─────────────────────────────────────────────
+
+function initTabs() {
+  const buttons = document.querySelectorAll(".tab-btn");
+  const panels = document.querySelectorAll(".tab-panel");
+
+  buttons.forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const target = btn.dataset.tab;
+
+      buttons.forEach((b) => b.classList.remove("active"));
+      panels.forEach((p) => p.classList.remove("active"));
+
+      btn.classList.add("active");
+      document.getElementById(target)?.classList.add("active");
+
+      // Refresh the table whenever the "Submissions" tab is opened
+      if (target === "tab-submissions") loadSubmissions();
+    });
+  });
+}
+
+// ─────────────────────────────────────────────
+// Registration form
+// ─────────────────────────────────────────────
+
+function initForm() {
+  const form = document.getElementById("registration-form");
+  const alertBox = document.getElementById("form-alert");
+  const outputSection = document.getElementById("output-section");
+  const recommendationsBox = document.getElementById("recommendations-box");
+  const loader = document.getElementById("form-loader");
+  const submitBtn = form.querySelector("button[type=submit]");
+
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    alertBox.innerHTML = "";
+    outputSection.style.display = "none";
+
+    const payload = {
+      name: form.name.value.trim(),
+      email: form.email.value.trim(),
+      skills: form.skills.value.trim(),
+      domain: form.domain.value.trim(),
+      graduation_year: form.graduation_year.value.trim(),
+    };
+
+    // Basic client-side validation
+    for (const [key, value] of Object.entries(payload)) {
+      if (!value) {
+        showAlert(alertBox, `Please fill in the "${key.replace("_", " ")}" field.`, "error");
+        return;
+      }
+    }
+
+    // Loading state
+    submitBtn.disabled = true;
+    submitBtn.textContent = "Analysing…";
+    loader.classList.add("active");
+
+    try {
+      const res = await fetch("/api/submit", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+
+      const data = await res.json();
+
+      if (!res.ok || !data.success) {
+        showAlert(alertBox, data.error ?? "Something went wrong. Please try again.", "error");
+        return;
+      }
+
+      // Show recommendations
+      recommendationsBox.textContent = data.recommendations;
+      outputSection.style.display = "block";
+      outputSection.scrollIntoView({ behavior: "smooth", block: "start" });
+
+      const emailMsg = data.email_sent
+        ? "✅ Recommendations also sent to your email!"
+        : "⚠️ Email delivery skipped (Gmail not configured on the server).";
+
+      showAlert(alertBox, `Analysis complete! ${emailMsg}`, data.email_sent ? "success" : "info");
+
+      form.reset();
+      updateStats();
+    } catch (err) {
+      showAlert(alertBox, "Network error — could not reach the server.", "error");
+    } finally {
+      submitBtn.disabled = false;
+      submitBtn.textContent = "🚀 Get My Career Recommendations";
+      loader.classList.remove("active");
+    }
+  });
+}
+
+// ─────────────────────────────────────────────
+// Submissions table
+// ─────────────────────────────────────────────
+
+async function loadSubmissions() {
+  const tbody = document.getElementById("submissions-tbody");
+  const emptyState = document.getElementById("submissions-empty");
+
+  tbody.innerHTML = `<tr><td colspan="7" style="text-align:center;padding:1.5rem;color:var(--text-muted)">Loading…</td></tr>`;
+
+  try {
+    const res = await fetch("/api/submissions");
+    const rows = await res.json();
+
+    if (!rows.length) {
+      tbody.innerHTML = "";
+      emptyState.style.display = "block";
+      return;
+    }
+
+    emptyState.style.display = "none";
+    tbody.innerHTML = rows
+      .map(
+        (r) => `
+      <tr>
+        <td><strong>${escapeHtml(r.name)}</strong></td>
+        <td>${escapeHtml(r.email)}</td>
+        <td>${escapeHtml(r.domain)}</td>
+        <td>${escapeHtml(r.graduation_year)}</td>
+        <td><span class="badge badge-neutral">${escapeHtml(truncate(r.skills, 40))}</span></td>
+        <td>
+          <span class="badge ${r.email_sent ? "badge-success" : "badge-warn"}">
+            ${r.email_sent ? "Sent ✓" : "Skipped"}
+          </span>
+        </td>
+        <td>${formatTime(r.timestamp)}</td>
+      </tr>`
+      )
+      .join("");
+  } catch {
+    tbody.innerHTML = `<tr><td colspan="7" style="text-align:center;padding:1.5rem;color:var(--danger)">Failed to load submissions.</td></tr>`;
+  }
+}
+
+function escapeHtml(str) {
+  if (!str) return "";
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+// ─────────────────────────────────────────────
+// Stats
+// ─────────────────────────────────────────────
+
+async function updateStats() {
+  try {
+    const res = await fetch("/api/health");
+    const { submissions } = await res.json();
+    const el = document.getElementById("stat-submissions");
+    if (el) el.textContent = submissions;
+  } catch {
+    // Silently ignore
+  }
+}
+
+// ─────────────────────────────────────────────
+// Init
+// ─────────────────────────────────────────────
+
+document.addEventListener("DOMContentLoaded", () => {
+  initTabs();
+  initForm();
+  updateStats();
+});
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FILE 7 of 7 │ README.md
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# AI Placement Agent using Zapier + Gemini
+
+A web-based placement recommendation system that automates career guidance
+for students using:
+  Google Forms → Google Sheets → Zapier → Gemini AI → Gmail → Student
+
+──────────────────────────────────────────────────────────────────────────────
+QUICK START
+──────────────────────────────────────────────────────────────────────────────
+
+1. Unpack the project:
+   tar -xzf placement-agent.tar.gz
+   cd placement-agent
+
+2. Create a virtual environment:
+   python -m venv venv
+   source venv/bin/activate        # Windows: venv\Scripts\activate
+   pip install -r requirements.txt
+
+3. Configure environment variables:
+   cp .env.example .env
+   (edit .env and fill in your keys)
+
+   Variable             | Where to get it
+   ---------------------|------------------------------------------------------
+   GEMINI_API_KEY       | https://aistudio.google.com/app/apikey
+   GMAIL_SENDER         | Your Gmail address
+   GMAIL_APP_PASSWORD   | https://support.google.com/accounts/answer/185833
+   FLASK_SECRET_KEY     | Any long random string
+
+4. Run the app:
+   python app.py
+   Open http://localhost:5000
+
+──────────────────────────────────────────────────────────────────────────────
+PROJECT STRUCTURE
+──────────────────────────────────────────────────────────────────────────────
+
+placement-agent/
+├── app.py                ← Flask backend (routes, Gemini AI, Gmail SMTP)
+├── requirements.txt      ← Python dependencies
+├── .env.example          ← Environment variable template
+├── templates/
+│   └── index.html        ← Dashboard (Jinja2 HTML template)
+├── static/
+│   ├── style.css         ← Responsive CSS stylesheet
+│   └── script.js         ← Frontend JavaScript
+└── README.md
+
+──────────────────────────────────────────────────────────────────────────────
+ZAPIER INTEGRATION
+──────────────────────────────────────────────────────────────────────────────
+
+Full workflow:
+  Google Form → Google Sheets → Zapier → Flask webhook → Gemini AI → Gmail
+
+Steps:
+  1. Create a Google Form (Full Name, Email, Skills, Domain, Grad Year)
+  2. Link Form responses to Google Sheets (Responses → Sheets icon)
+  3. New Zap → Trigger: Google Sheets "New Spreadsheet Row"
+  4. Action: Webhooks by Zapier → POST
+       URL: https://your-app.replit.app/api/zapier-webhook
+       Payload type: json
+       Map: name, email, skills, domain, graduation_year
+  5. Test → Turn Zap ON
+
+──────────────────────────────────────────────────────────────────────────────
+API REFERENCE
+──────────────────────────────────────────────────────────────────────────────
+
+  POST /api/submit            Submit student data, get AI recommendations
+  GET  /api/submissions       List all submissions
+  POST /api/zapier-webhook    Zapier webhook endpoint
+  GET  /api/health            Health check
+
+──────────────────────────────────────────────────────────────────────────────
+DEPLOYMENT ON REPLIT
+──────────────────────────────────────────────────────────────────────────────
+
+  1. Create a new Python Repl and upload all project files
+  2. Add Secrets: GEMINI_API_KEY, GMAIL_SENDER, GMAIL_APP_PASSWORD, FLASK_SECRET_KEY
+  3. Set run command: python app.py
+  4. Your live URL: https://<your-repl>.replit.app
+  5. Use that URL in the Zapier webhook action
+
+──────────────────────────────────────────────────────────────────────────────
+SECURITY NOTES
+──────────────────────────────────────────────────────────────────────────────
+
+  - Never commit .env to version control
+  - Use a Gmail App Password, NOT your real Gmail password
+  - Rotate FLASK_SECRET_KEY before going to production
+
+──────────────────────────────────────────────────────────────────────────────
+LICENSE: MIT — free to use, modify, and distribute
+──────────────────────────────────────────────────────────────────────────────
+
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                        END OF ALL_CODE.txt                                 ║
+║             7 files | AI Placement Agent using Zapier + Gemini             ║
+╚══════════════════════════════════════════════════════════════════════════════╝
